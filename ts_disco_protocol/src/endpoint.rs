@@ -87,7 +87,7 @@ impl Endpoint {
         };
 
         Self {
-            addr: zerocopy::transmute!(ip.segments()),
+            addr: zerocopy::transmute!(ip.octets()),
             port: zerocopy::U16::new(sa.port()),
         }
     }
@@ -120,7 +120,7 @@ impl From<Endpoint> for SocketAddr {
 impl From<SocketAddrV6> for Endpoint {
     fn from(value: SocketAddrV6) -> Self {
         Self {
-            addr: zerocopy::transmute!(value.ip().segments()),
+            addr: zerocopy::transmute!(value.ip().octets()),
             port: value.port().into(),
         }
     }

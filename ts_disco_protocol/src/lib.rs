@@ -133,4 +133,40 @@ mod test {
             cmm.endpoints[2] = "[c:d::]:1234".parse::<SocketAddrV6>().unwrap().into();
         });
     }
+
+    /// The wire format of an [`Endpoint`] is the 16 raw bytes of the (mapped) IPv6
+    /// address in network order followed by the port in network order, matching the
+    /// Go implementation (`disco.CallMeMaybe`: `addr.As16()` + big-endian port).
+    /// These expectations are fixed byte vectors, so this test must pass regardless
+    /// of host endianness.
+    #[test]
+    fn endpoint_wire_format() {
+        let v6 = Endpoint::from_socket_addr("[2001:db8::1]:4660".parse().unwrap());
+        assert_eq!(
+            v6.as_bytes(),
+            [
+                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, // addr
+                0x12, 0x34, // port 4660
+            ]
+        );
+
+        let v4 = Endpoint::from_socket_addr("192.0.2.1:80".parse().unwrap());
+        assert_eq!(
+            v4.as_bytes(),
+            [
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xc0, 0x00, 0x02, 0x01, // ::ffff:192.0.2.1
+                0x00, 0x50, // port 80
+            ]
+        );
+    }
+
+    /// Converting a socket address to an [`Endpoint`] and back must be lossless on
+    /// any host endianness.
+    #[test]
+    fn endpoint_roundtrip_socket_addr() {
+        for addr in ["[2001:db8::1]:4660", "192.0.2.1:80", "[::1]:22"] {
+            let sa: core::net::SocketAddr = addr.parse().unwrap();
+            assert_eq!(Endpoint::from_socket_addr(sa).socket_addr(), sa);
+        }
+    }
 }
