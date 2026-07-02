@@ -1,5 +1,5 @@
 use core::{
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::Duration,
 };
 use std::sync::Arc;
@@ -12,9 +12,14 @@ use kameo::{
     reply::DelegatedReply,
 };
 use tokio::sync::watch;
-use ts_control::{AsyncControlClient, Error as ControlError, Node, StateUpdate};
+use ts_control::{
+    AsyncControlClient, Endpoint, EndpointType, Error as ControlError, Node, StateUpdate,
+};
 
-use crate::derp_latency::{DerpLatencyMeasurement, DerpLatencyMeasurer};
+use crate::{
+    derp_latency::{DerpLatencyMeasurement, DerpLatencyMeasurer},
+    stunner::StunAddress,
+};
 
 /// Actor responsible for maintaining the connection to control.
 ///
@@ -24,6 +29,9 @@ pub struct ControlRunner {
     params: Params,
 
     self_node: watch::Sender<Option<Node>>,
+
+    /// Endpoint advertisement state; `None` when advertisement is disabled.
+    advertise: Option<AdvertiseState>,
 }
 
 /// Control runner args.
@@ -70,7 +78,7 @@ impl kameo::Actor for ControlRunner {
             }
         }
 
-        let (client, stream) = AsyncControlClient::connect(
+        let (mut client, stream) = AsyncControlClient::connect(
             &params.config,
             &params.env.keys,
             params.auth_key.as_deref(),
@@ -82,13 +90,143 @@ impl kameo::Actor for ControlRunner {
             .spawn()
             .await;
 
+        let mut advertise = AdvertiseState::from_env();
+        if let Some(adv) = &mut advertise {
+            params.env.subscribe::<StunAddress>(&slf).await?;
+            tracing::info!(
+                static_endpoints = ?adv.static_endpoints,
+                stun_port = ?adv.stun_port,
+                "endpoint advertisement enabled"
+            );
+
+            // Advertise any statically-configured endpoints right away; the
+            // STUN-derived one follows once the first measurement arrives.
+            let endpoints = adv.compose(None);
+            if !endpoints.is_empty() {
+                client.set_endpoints(endpoints.clone()).await;
+                adv.last_sent = endpoints;
+            }
+        }
+
         slf.attach_stream(stream.boxed(), (), ());
 
         Ok(Self {
             client,
             params,
             self_node: Default::default(),
+            advertise,
         })
+    }
+}
+
+/// State for advertising this node's magicsock UDP endpoints to control.
+///
+/// Direct connections aren't implemented yet, but advertising endpoints (and
+/// observing the disco pings that peers then send; see [`crate::udp_probe`])
+/// validates the groundwork for them.
+struct AdvertiseState {
+    /// Endpoints from `TS_RS_ADVERTISE_ENDPOINT`, always advertised. Useful
+    /// when the node sits behind a port-forwarded router and its public
+    /// endpoint is known and fixed.
+    static_endpoints: Vec<SocketAddr>,
+
+    /// Port to combine with STUN-discovered public addresses; `None` when no
+    /// local UDP socket is bound (i.e. the probe is disabled), in which case
+    /// STUN results are not advertised.
+    stun_port: Option<u16>,
+
+    /// The most recently advertised endpoint set, to suppress resends.
+    last_sent: Vec<Endpoint>,
+}
+
+impl AdvertiseState {
+    /// Build from `TS_RS_ADVERTISE_ENDPOINT` (a comma-separated `ip:port`
+    /// list) and the UDP probe configuration. Returns `None` when neither is
+    /// configured, which disables endpoint advertisement entirely and leaves
+    /// upstream behavior unchanged.
+    fn from_env() -> Option<Self> {
+        let raw = std::env::var("TS_RS_ADVERTISE_ENDPOINT").ok();
+        let static_endpoints = Self::parse_static(raw.as_deref().unwrap_or_default());
+        let stun_port = crate::udp_probe::configured_port();
+
+        if static_endpoints.is_empty() && stun_port.is_none() {
+            return None;
+        }
+
+        Some(Self {
+            static_endpoints,
+            stun_port,
+            last_sent: Vec::new(),
+        })
+    }
+
+    /// Parse a comma-separated `ip:port` list, warning on (and skipping) any
+    /// entry that doesn't parse.
+    fn parse_static(raw: &str) -> Vec<SocketAddr> {
+        raw.split(',')
+            .filter_map(|part| {
+                let part = part.trim();
+                if part.is_empty() {
+                    return None;
+                }
+
+                match part.parse() {
+                    Ok(sa) => Some(sa),
+                    Err(e) => {
+                        tracing::warn!(
+                            endpoint = %part,
+                            error = %e,
+                            "ignoring unparseable TS_RS_ADVERTISE_ENDPOINT entry"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Compose the endpoint set to advertise given the latest STUN-discovered
+    /// public address, deduplicating while preserving order.
+    fn compose(&self, stun_addr: Option<IpAddr>) -> Vec<Endpoint> {
+        let mut out: Vec<Endpoint> = self
+            .static_endpoints
+            .iter()
+            .map(|&endpoint| Endpoint {
+                endpoint,
+                ty: EndpointType::ExplicitConf,
+            })
+            .collect();
+
+        if let (Some(addr), Some(port)) = (stun_addr, self.stun_port) {
+            let endpoint = SocketAddr::new(addr, port);
+            if !out.iter().any(|e| e.endpoint == endpoint) {
+                out.push(Endpoint {
+                    endpoint,
+                    ty: EndpointType::Stun,
+                });
+            }
+        }
+
+        out
+    }
+}
+
+impl Message<StunAddress> for ControlRunner {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: StunAddress, _ctx: &mut Context<Self, Self::Reply>) {
+        let Some(advertise) = &mut self.advertise else {
+            return;
+        };
+
+        let endpoints = advertise.compose(Some(msg.addr));
+        if endpoints.is_empty() || endpoints == advertise.last_sent {
+            return;
+        }
+
+        tracing::info!(?endpoints, "advertising updated endpoints to control");
+        self.client.set_endpoints(endpoints.clone()).await;
+        advertise.last_sent = endpoints;
     }
 }
 
@@ -247,5 +385,70 @@ impl Message<DerpLatencyMeasurement> for ControlRunner {
         tracing::debug!(selected_region_id = ?region_id, ?pinned, "updating home region");
 
         self.client.set_home_region(region_id, iter).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_static_endpoints() {
+        assert_eq!(AdvertiseState::parse_static(""), vec![]);
+        assert_eq!(
+            AdvertiseState::parse_static("203.0.113.5:41641, [2001:db8::1]:22,bogus"),
+            vec![
+                "203.0.113.5:41641".parse::<SocketAddr>().unwrap(),
+                "[2001:db8::1]:22".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn compose_endpoints() {
+        let state = AdvertiseState {
+            static_endpoints: vec!["203.0.113.5:41641".parse().unwrap()],
+            stun_port: Some(41641),
+            last_sent: Vec::new(),
+        };
+
+        // Static only.
+        assert_eq!(
+            state.compose(None),
+            vec![Endpoint {
+                endpoint: "203.0.113.5:41641".parse().unwrap(),
+                ty: EndpointType::ExplicitConf,
+            }]
+        );
+
+        // Static + STUN-discovered address.
+        assert_eq!(
+            state.compose(Some("198.51.100.7".parse().unwrap())),
+            vec![
+                Endpoint {
+                    endpoint: "203.0.113.5:41641".parse().unwrap(),
+                    ty: EndpointType::ExplicitConf,
+                },
+                Endpoint {
+                    endpoint: "198.51.100.7:41641".parse().unwrap(),
+                    ty: EndpointType::Stun,
+                },
+            ]
+        );
+
+        // A STUN address equal to a static endpoint is deduplicated.
+        assert_eq!(state.compose(Some("203.0.113.5".parse().unwrap())).len(), 1);
+
+        // No STUN port bound: STUN results are not advertised.
+        let no_probe = AdvertiseState {
+            stun_port: None,
+            ..state
+        };
+        assert_eq!(
+            no_probe
+                .compose(Some("198.51.100.7".parse().unwrap()))
+                .len(),
+            1
+        );
     }
 }

@@ -8,6 +8,8 @@ use tokio::{
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use url::Url;
 
+use ts_control_serde::Endpoint;
+
 use crate::{
     ControlDialer, Error,
     map_request_builder::MapRequestBuilder,
@@ -145,6 +147,23 @@ impl AsyncControlClient {
         }
     }
 
+    /// Report this node's magicsock UDP endpoints to control.
+    ///
+    /// Control distributes these to peers via the netmap, which is what makes
+    /// them try to establish direct connections to this node.
+    #[tracing::instrument(skip_all, fields(map_url = %self.map_url(), n = endpoints.len()), level = "trace")]
+    pub async fn set_endpoints(&mut self, endpoints: Vec<Endpoint>) {
+        tracing::trace!(?endpoints, "reporting endpoints to control server");
+
+        if let Err(e) = self
+            .command_tx
+            .send(Command::SetEndpoints { endpoints })
+            .await
+        {
+            tracing::error!(error = %e, "setting endpoints");
+        }
+    }
+
     /// Construct the URL that should be used to fetch the netmap.
     pub fn map_url(&self) -> Url {
         self.base_url
@@ -163,6 +182,9 @@ pub enum Command {
     SetDerpHomeRegion {
         id: ts_derp::RegionId,
         latencies: BTreeMap<String, f64>,
+    },
+    SetEndpoints {
+        endpoints: Vec<Endpoint>,
     },
 }
 
@@ -263,6 +285,21 @@ async fn run_once(
                             .stream(false)
                             .preferred_derp(id)
                             .derp_latencies(latencies.iter().map(|(k, v)| (k.as_str(), *v)));
+
+                        if let Some(hostname) = &config.hostname {
+                            builder = builder.hostname(hostname);
+                        }
+                        let req = builder.build();
+
+                        drop(send_map_request(req, &map_url, &h2_client).await?);
+                    },
+
+                    Command::SetEndpoints { endpoints } => {
+                        let mut builder = MapRequestBuilder::new(node_keys)
+                            .keep_alive(false)
+                            .omit_peers(true)
+                            .stream(false)
+                            .endpoints(endpoints);
 
                         if let Some(hostname) = &config.hostname {
                             builder = builder.hostname(hostname);

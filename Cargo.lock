@@ -6239,6 +6239,7 @@ dependencies = [
  "ts_control",
  "ts_dataplane",
  "ts_derp",
+ "ts_disco_protocol",
  "ts_keys",
  "ts_netcheck",
  "ts_netmon",

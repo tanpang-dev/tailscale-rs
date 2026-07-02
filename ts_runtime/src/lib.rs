@@ -31,6 +31,7 @@ pub mod peer_tracker;
 mod route_updater;
 mod src_filter;
 mod stunner;
+mod udp_probe;
 
 pub(crate) use env::Env;
 pub use error::{Error, ErrorKind};
@@ -127,6 +128,7 @@ impl Runtime {
         let pf_upd = packetfilter::PacketfilterUpdater::spawn(env.clone());
         let src_upd = src_filter::SourceFilterUpdater::spawn(env.clone());
         let stunner = stunner::Stunner::spawn(env.clone());
+        let udp_probe = udp_probe::UdpProbe::spawn(env.clone());
 
         let netmon = ts_netmon::platform_mon()
             .map(|mon| netmon::NetmonActor::spawn((env.clone(), Arc::new(mon))));
@@ -177,6 +179,7 @@ impl Runtime {
             pf_upd,
             src_upd,
             stunner,
+            udp_probe,
             peer_tracker,
             netstack,
             control,

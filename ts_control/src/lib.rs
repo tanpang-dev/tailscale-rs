@@ -32,6 +32,7 @@ pub use node::{
     Id as NodeId, Node, NodeLastSeen, NodeStatus, NodeUpdate, StableId as StableNodeId,
     TailnetAddress,
 };
+pub use ts_control_serde::{Endpoint, EndpointType};
 
 #[cfg(feature = "async_tokio")]
 pub use crate::tokio::{AsyncControlClient, FilterUpdate, PeerUpdate, StateUpdate};

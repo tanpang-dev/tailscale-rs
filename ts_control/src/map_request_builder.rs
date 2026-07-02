@@ -1,5 +1,5 @@
 use ts_capabilityversion::CapabilityVersion;
-use ts_control_serde::{HostInfo, MapRequest, NetInfo};
+use ts_control_serde::{Endpoint, HostInfo, MapRequest, NetInfo};
 
 /// Builder type for [`MapRequest`]s; smooths over the annoying parts of creating a request.
 #[derive(Debug, Clone)]
@@ -77,6 +77,12 @@ impl<'a> MapRequestBuilder<'a> {
     pub fn derp_latencies(mut self, value: impl IntoIterator<Item = (&'a str, f64)>) -> Self {
         self.net_info_mut().derp_latency = Some(value.into_iter().collect());
 
+        self
+    }
+
+    /// Set the [`MapRequest::endpoints`] field.
+    pub fn endpoints(mut self, value: impl IntoIterator<Item = Endpoint>) -> Self {
+        self.req.endpoints = value.into_iter().collect();
         self
     }
 
