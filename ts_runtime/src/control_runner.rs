@@ -212,9 +212,29 @@ impl Message<DerpLatencyMeasurement> for ControlRunner {
     async fn handle(&mut self, msg: DerpLatencyMeasurement, _ctx: &mut Context<Self, Self::Reply>) {
         let measurements = msg.measurement.as_ref().clone();
 
-        let Some(result) = measurements.first() else {
-            tracing::debug!("derp latency measurements empty");
-            return;
+        // Optionally pin the home DERP region unconditionally. On the Wii,
+        // netcheck measures latency via a TLS handshake, which is extremely
+        // jittery on the slow CPU: the measurement terminates early (after a
+        // few regions respond), so the nearest region (Tokyo) is often absent
+        // from the results and latency-based selection drifts to a far or
+        // poorly-reachable region — which can even leave the node unreachable.
+        // When TS_RS_HOME_REGION is set we force that region regardless of the
+        // measurement (the region must exist in the control-provided DERP map).
+        let pinned = std::env::var("TS_RS_HOME_REGION")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .and_then(std::num::NonZeroU32::new)
+            .map(ts_derp::RegionId);
+
+        let region_id = match pinned {
+            Some(id) => id,
+            None => match measurements.first() {
+                Some(result) => result.id,
+                None => {
+                    tracing::debug!("derp latency measurements empty");
+                    return;
+                }
+            },
         };
 
         let iter = measurements.iter().map(|result| {
@@ -224,8 +244,8 @@ impl Message<DerpLatencyMeasurement> for ControlRunner {
             )
         });
 
-        tracing::debug!(selected_region_id = ?result.id, "updating home region");
+        tracing::debug!(selected_region_id = ?region_id, ?pinned, "updating home region");
 
-        self.client.set_home_region(result.id, iter).await;
+        self.client.set_home_region(region_id, iter).await;
     }
 }

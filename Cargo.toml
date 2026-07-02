@@ -259,5 +259,8 @@ name = "peer_ping"
 name = "tcp_echo"
 
 [[example]]
+name = "wii_forward"
+
+[[example]]
 name = "ssh_peer_lookup"
 required-features = ["ssh"]

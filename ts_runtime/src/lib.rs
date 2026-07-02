@@ -133,8 +133,24 @@ impl Runtime {
 
         let peer_tracker = PeerTracker::spawn(env.clone());
 
-        let netstack =
-            NetstackActor::spawn((env.clone(), Default::default(), netstack_up, netstack_down));
+        let netstack = NetstackActor::spawn((
+            env.clone(),
+            netstack::netcore::Config {
+                // The default 16 KiB TCP socket buffer caps throughput on the
+                // high-latency DERP-relay path (tailscale-rs has no P2P fast
+                // path). A very large buffer (512 KiB) raises the peak but makes
+                // stalls worse: DERP is best-effort and drops packets under bulk
+                // load, and a large receive window is prone to a zero-window
+                // deadlock when the window-update segment is dropped. 128 KiB is
+                // a middle ground — more window than 16 KiB, but small enough to
+                // refill and re-advertise the window frequently. Cost: ~2x this
+                // per TCP connection (rx + tx buffers).
+                tcp_buffer_size: 128 * 1024,
+                ..Default::default()
+            },
+            netstack_up,
+            netstack_down,
+        ));
 
         let control = ControlRunner::spawn(control_runner::Params {
             config,

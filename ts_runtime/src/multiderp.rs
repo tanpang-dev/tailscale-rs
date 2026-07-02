@@ -325,13 +325,30 @@ impl Message<DerpLatencyMeasurement> for Multiderp {
     type Reply = ();
 
     async fn handle(&mut self, msg: DerpLatencyMeasurement, _ctx: &mut Context<Self, Self::Reply>) {
-        let Some(result) = msg.measurement.as_ref().first() else {
-            tracing::trace!("received home derp measurement message but none was set");
-            return;
+        // Optionally pin the home DERP region unconditionally. This actor
+        // establishes the actual home DERP connection, so the pin must be
+        // applied here as well as in ControlRunner (which only reports the home
+        // region to control). Without this, a re-measurement (e.g. after a
+        // netmap stream restart) drifts the live connection to a far region and
+        // can leave the node unreachable. See ControlRunner for the rationale.
+        let pinned = std::env::var("TS_RS_HOME_REGION")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .and_then(std::num::NonZeroU32::new)
+            .map(RegionId);
+
+        let new_region_id = match pinned {
+            Some(id) => id,
+            None => match msg.measurement.as_ref().first() {
+                Some(result) => result.id,
+                None => {
+                    tracing::trace!("received home derp measurement message but none was set");
+                    return;
+                }
+            },
         };
 
         // Bail early if the home derp region hasn't changed.
-        let new_region_id = result.id;
         if self.current_home_derp == Some(new_region_id) {
             tracing::debug!("received home derp measurement message, no change to home region");
             return;
@@ -367,9 +384,15 @@ impl Message<DerpLatencyMeasurement> for Multiderp {
         // Unwrap is safe, we verified self.derps holds new_region_id above, and hold &mut self.
         let new_region = self.derps.get_mut(&new_region_id).unwrap();
         new_region.home_derp.send_replace(true);
+        let latency_ms = msg
+            .measurement
+            .as_ref()
+            .iter()
+            .find(|r| r.id == new_region_id)
+            .map(|r| r.latency.as_secs_f32() * 1000.);
         tracing::info!(
             region_id = %new_region_id,
-            latency_ms = result.latency.as_secs_f32() * 1000.,
+            ?latency_ms,
             "new home derp region selected"
         );
     }
