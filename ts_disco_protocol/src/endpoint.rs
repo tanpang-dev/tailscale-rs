@@ -87,7 +87,10 @@ impl Endpoint {
         };
 
         Self {
-            addr: zerocopy::transmute!(ip.segments()),
+            // Use the network-order bytes, not `segments()`: transmuting the
+            // host-order `[u16; 8]` would byte-swap each segment on
+            // little-endian hosts.
+            addr: zerocopy::transmute!(ip.octets()),
             port: zerocopy::U16::new(sa.port()),
         }
     }
@@ -120,7 +123,8 @@ impl From<Endpoint> for SocketAddr {
 impl From<SocketAddrV6> for Endpoint {
     fn from(value: SocketAddrV6) -> Self {
         Self {
-            addr: zerocopy::transmute!(value.ip().segments()),
+            // See `from_socket_addr` for why this must be `octets()`.
+            addr: zerocopy::transmute!(value.ip().octets()),
             port: value.port().into(),
         }
     }
