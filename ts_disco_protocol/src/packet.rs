@@ -193,8 +193,10 @@ impl Packet<Plaintext> {
     ) -> Result<&mut Packet<Encrypted>, Error> {
         let bx = crypto_box::SalsaBox::new(&receiver.into(), &secret.into());
 
-        self.header.sender_pub = secret.public_key();
-        self.header.nonce = nonce;
+        // Write the full header, including the magic bytes. `init_from_bytes`
+        // leaves the header zeroed, so setting only sender_pub and nonce here
+        // would produce a packet the receiver rejects with `WrongMagic`.
+        self.header = Header::new(secret.public_key(), nonce);
 
         let tag = bx
             .encrypt_in_place_detached(&GenericArray::from(nonce), &[], &mut self.payload.payload)

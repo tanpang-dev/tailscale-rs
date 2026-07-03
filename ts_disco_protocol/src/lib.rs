@@ -111,6 +111,28 @@ mod test {
         });
     }
 
+    /// An encrypted packet must carry the header magic, so a receiver can parse
+    /// it with `from_encrypted_bytes` (as happens on the wire) rather than only
+    /// via `decrypt_in_place`.
+    #[test]
+    fn encrypted_packet_has_magic() {
+        let sender = DiscoPrivateKey::random();
+        let receiver = DiscoPrivateKey::random();
+
+        let mut buf = alloc::vec![0; Packet::size_for_message(Pong::size())];
+        let pkt = Packet::init_from_bytes::<Pong>(&mut buf, |pong: &mut Pong| {
+            pong.tx_id = [3u8; 12];
+            pong.src = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 22, 0, 0).into();
+        })
+        .unwrap();
+        pkt.encrypt_in_place(&sender, &receiver.public_key(), [4u8; 24])
+            .unwrap();
+
+        // Parsing the encrypted bytes validates the magic.
+        let parsed = Packet::<Encrypted>::from_encrypted_bytes_mut(&mut buf).unwrap();
+        parsed.decrypt_in_place(&receiver).unwrap();
+    }
+
     #[test]
     fn roundtrip_pong() {
         let mut rng = rand::rng();
