@@ -122,7 +122,7 @@ impl kameo::Actor for ControlRunner {
 /// State for advertising this node's magicsock UDP endpoints to control.
 ///
 /// Direct connections aren't implemented yet, but advertising endpoints (and
-/// observing the disco pings that peers then send; see [`crate::udp_probe`])
+/// observing the disco pings that peers then send; see [`crate::udp_transport`])
 /// validates the groundwork for them.
 struct AdvertiseState {
     /// Endpoints from `TS_RS_ADVERTISE_ENDPOINT`, always advertised. Useful
@@ -147,7 +147,7 @@ impl AdvertiseState {
     fn from_env() -> Option<Self> {
         let raw = std::env::var("TS_RS_ADVERTISE_ENDPOINT").ok();
         let static_endpoints = Self::parse_static(raw.as_deref().unwrap_or_default());
-        let stun_port = crate::udp_probe::configured_port();
+        let stun_port = crate::udp_transport::configured_port();
 
         if static_endpoints.is_empty() && stun_port.is_none() {
             return None;
