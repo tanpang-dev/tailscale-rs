@@ -8,7 +8,7 @@ use tokio::{
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use url::Url;
 
-use ts_control_serde::Endpoint;
+use ts_control_serde::{Endpoint, EndpointType};
 
 use crate::{
     ControlDialer, Error,
@@ -240,7 +240,12 @@ async fn run_once(
     let builder = MapRequestBuilder::new(node_keys)
         .keep_alive(true)
         .omit_peers(false)
-        .stream(true);
+        .stream(true)
+        // Include statically-configured endpoints in the map-poll request
+        // itself (the same request that carries the disco key), so control
+        // distributes them to peers from the start. Endpoints sent only in a
+        // later lite (Stream:false) request are accepted but not propagated.
+        .endpoints(advertise_endpoints_from_env());
 
     let request = if let Some(hostname) = &config.hostname {
         builder.hostname(hostname)
@@ -314,6 +319,33 @@ async fn run_once(
     }
 
     Ok(())
+}
+
+/// Parse statically-configured advertised endpoints from `TS_RS_ADVERTISE_ENDPOINT`
+/// (a comma-separated `ip:port` list). Unparseable entries are skipped.
+fn advertise_endpoints_from_env() -> Vec<Endpoint> {
+    let Ok(raw) = std::env::var("TS_RS_ADVERTISE_ENDPOINT") else {
+        return Vec::new();
+    };
+
+    raw.split(',')
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+            match part.parse() {
+                Ok(endpoint) => Some(Endpoint {
+                    endpoint,
+                    ty: EndpointType::ExplicitConf,
+                }),
+                Err(e) => {
+                    tracing::warn!(endpoint = %part, error = %e, "ignoring unparseable advertised endpoint");
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 fn netmap_stream(
