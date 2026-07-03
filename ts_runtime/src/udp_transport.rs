@@ -219,14 +219,22 @@ impl kameo::Actor for UdpUnderlay {
         );
 
         let (disco_tx, disco_rx) = mpsc::unbounded_channel();
-        spawn_disco_observer(disco_rx, env.shutdown.clone());
 
         if !transport_enabled() {
             tracing::info!(port, "udp socket listening (observe only)");
-            // Drain the socket so the observer sees traffic; no transport.
+            // Observe-only: log disco packets but never reply.
+            spawn_disco_observer(disco_rx, env.shutdown.clone());
             spawn_observe_only(socket, disco_tx, env.shutdown.clone());
             return Ok(Self { table });
         }
+
+        // Transport mode: reply to disco pings so peers can establish a direct path.
+        crate::disco::spawn(
+            disco_rx,
+            socket.clone(),
+            env.keys.disco_keys.private.clone(),
+            env.shutdown.clone(),
+        );
 
         env.subscribe::<Arc<PeerState>>(&slf).await?;
 
