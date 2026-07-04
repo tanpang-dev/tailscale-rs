@@ -193,9 +193,13 @@ impl UnderlayTransport for UdpTransport {
                             // idle, so stamping here keeps the direct route from
                             // decaying to DERP between bulk transfers, when no
                             // WireGuard data is flowing to refresh it.
-                            if let Some(peer) =
-                                self.table.read().unwrap().addr_to_peer.get(&src).copied()
-                            {
+                            // NB: bind the lookup result first so the read
+                            // guard is dropped before taking the write locks
+                            // below (an `if let` on the guard expression would
+                            // keep it alive across the body and self-deadlock).
+                            let peer =
+                                self.table.read().unwrap().addr_to_peer.get(&src).copied();
+                            if let Some(peer) = peer {
                                 self.direct
                                     .write()
                                     .unwrap()
