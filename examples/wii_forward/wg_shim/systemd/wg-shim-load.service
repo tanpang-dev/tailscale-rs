@@ -1,0 +1,13 @@
+[Unit]
+Description=Load wg_shim + wireguard kernel modules for the tailscale bridge
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh /root/wg_shim/wg_load.sh
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=tailscale-rs userspace node (wii_forward) exposing local SSH on the tailnet
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root
+Environment=TS_RS_EXPERIMENT=this_is_unstable_software
+Environment=RUST_LOG=info
+Environment=TS_RS_HOME_REGION=7
+Environment=TS_RS_UDP=1
+Environment=TS_RS_UDP_PORT=41641
+Environment=TS_RS_ADVERTISE_ENDPOINT=192.168.0.50:41641,59.132.59.87:41641
+ExecStart=/root/wii_forward -H wii-linux -f 22:127.0.0.1:22 -f 445:127.0.0.1:445
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
