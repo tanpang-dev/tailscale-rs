@@ -1,40 +1,23 @@
-//! Kernel WireGuard bridge: an alternative dataplane that hands the actual
-//! WireGuard crypto to a Linux kernel `wireguard` device instead of running it
-//! in userspace (`ts_tunnel`) on top of the smoltcp netstack.
+//! Kernel WireGuard bridge: an alternative dataplane that hands WireGuard
+//! crypto to a Linux kernel `wireguard` device instead of running it in
+//! userspace (`ts_tunnel` + smoltcp).
 //!
-//! # Why
+//! A bare kernel WG device cannot join a tailnet: magicsock drops handshakes
+//! from endpoints it has not validated over disco first. So the tailscale-rs
+//! control plane (login, netmap, STUN, disco, DERP) keeps running, and only
+//! the packet path is replaced.
 //!
-//! On very slow hardware (the Wii: 729 MHz single core) the userspace WG +
-//! smoltcp path tops out around ~29 KB/s, while the kernel WireGuard engine
-//! reaches multiple MB/s on the same box. But a bare kernel WG device cannot
-//! join a tailnet on its own: Tailscale's `magicsock` drops WireGuard
-//! handshakes from a source it has not first validated over the *disco*
-//! endpoint-discovery protocol.
+//! For each peer the bridge binds a loopback UDP socket `L_i` and sets the
+//! kernel device's endpoint for that peer to it:
 //!
-//! So we keep the whole tailscale-rs control plane — login, netmap, STUN,
-//! disco, DERP — running (all of it is lightweight), and replace only the
-//! data plane. This module is that replacement: it shovels raw WireGuard UDP
-//! payloads between the runtime's underlay transports (the real 41641 socket
-//! and the DERP relays) and a kernel `wg0` device over the loopback interface.
+//! * inbound: `(PeerId, bytes)` from an underlay transport → sent from `L_i`
+//!   to the device's listen port; the kernel sees `L_i` as the peer.
+//! * outbound: the device emits to `L_i` → forwarded out the peer's currently
+//!   selected transport (direct UDP or DERP, per `PeerRouteUpdate`).
 //!
-//! # Plumbing (per-peer loopback socket)
-//!
-//! For each peer the bridge binds a loopback UDP socket `L_i` (127.0.0.1:port)
-//! and points the kernel device's endpoint for that peer at it
-//! (`wg set wg0 peer <pub> endpoint 127.0.0.1:L_i`). Then:
-//!
-//! * inbound (peer → us): a WG payload arrives on an underlay transport as
-//!   `(PeerId, bytes)`; the bridge sends the bytes from `L_i` to the kernel
-//!   device's listen port. The kernel treats `L_i` as the peer's endpoint.
-//! * outbound (us → peer): the kernel device emits a WG payload to `L_i`; the
-//!   bridge reads it there, looks up the peer's currently selected transport
-//!   (direct UDP or DERP, from [`crate::route_updater::PeerRouteUpdate`]) and
-//!   forwards the bytes out that transport.
-//!
-//! All crypto stays in the kernel; userspace only does a memcpy and a route
-//! lookup per packet. Decrypted L3 traffic surfaces on `wg0` and is handled by
-//! the kernel IP stack directly (e.g. the box's real `sshd`), so no netstack or
-//! port-forwarding is needed in this mode.
+//! Crypto stays in the kernel and decrypted L3 surfaces on the device itself,
+//! so services (sshd, smbd) answer on the tailnet IP without a netstack or
+//! port forwards. Enabled with `TS_RS_KERNEL_WG=<ifname>`.
 
 use std::{
     collections::HashMap,
@@ -51,27 +34,22 @@ use ts_transport::{OverlayTransportId, PeerId, UnderlayTransportId};
 
 use crate::{peer_tracker::PeerState, udp_transport::SharedDirect};
 
-/// The kernel device's own listen port, on loopback. Real peers never talk to
-/// this port directly — everything reaches it through the per-peer `L_i`
-/// sockets — so its exact value only matters for our own loopback traffic.
+/// The kernel device's listen port on loopback. Only our `L_i` sockets ever
+/// talk to it.
 const WG_LISTEN_PORT: u16 = 51821;
 
-/// Conservative tunnel MTU, matching Tailscale's own default, to stay well
-/// under any path MTU on the underlay.
+/// Tunnel MTU, matching Tailscale's default.
 const WG_MTU: u32 = 1280;
 
-/// The CGNAT range Tailscale hands out 100.x addresses from; routed to `wg0` so
-/// the kernel sends tailnet-destined traffic through the device.
+/// The Tailscale CGNAT range, routed to the device as a whole; individual
+/// peer /32s all fall inside it.
 const TAILNET_CIDR: &str = "100.64.0.0/10";
 
-/// Outbound queue toward one underlay transport (bridge → transport).
-type OutboundTx = tokio::sync::mpsc::UnboundedSender<(PeerId, Vec<PacketMut>)>;
-/// Inbound queue from all underlay transports (transport → bridge).
-type InboundTx = tokio::sync::mpsc::UnboundedSender<(PeerId, Vec<PacketMut>)>;
-type InboundRx = tokio::sync::mpsc::UnboundedReceiver<(PeerId, Vec<PacketMut>)>;
+type PacketTx = tokio::sync::mpsc::UnboundedSender<(PeerId, Vec<PacketMut>)>;
+type PacketRx = tokio::sync::mpsc::UnboundedReceiver<(PeerId, Vec<PacketMut>)>;
 
-/// The interface name to run the kernel-WG bridge on, from `TS_RS_KERNEL_WG`,
-/// or `None` to use the normal userspace dataplane.
+/// The interface name from `TS_RS_KERNEL_WG`, or `None` for the normal
+/// userspace dataplane.
 pub fn configured() -> Option<String> {
     std::env::var("TS_RS_KERNEL_WG")
         .ok()
@@ -79,13 +57,11 @@ pub fn configured() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// A peer's live loopback link to the kernel device.
+/// A peer's loopback link to the kernel device.
 struct PeerLink {
-    /// Bound to `127.0.0.1:L_i`, connected to `127.0.0.1:WG_LISTEN_PORT`.
     sock: Arc<UdpSocket>,
-    /// The reader task forwarding kernel output for this peer to its transport.
     reader: JoinHandle<()>,
-    /// The peer's WG public key, base64, for `wg set ... peer <pub> remove`.
+    /// Base64 public key, for `wg set ... peer <pub> remove`.
     pubkey: String,
 }
 
@@ -97,21 +73,18 @@ impl Drop for PeerLink {
 
 struct Shared {
     ifname: String,
-    /// Written by transports (inbound WG payloads), read by the inbound task.
-    inbound_tx: InboundTx,
-    /// Outbound queues, one per registered underlay transport.
-    transports: RwLock<HashMap<UnderlayTransportId, OutboundTx>>,
+    inbound_tx: PacketTx,
+    /// Outbound queue per registered underlay transport.
+    transports: RwLock<HashMap<UnderlayTransportId, PacketTx>>,
     next_transport: AtomicU32,
-    /// Per-peer selected transport, from `PeerRouteUpdate` (direct vs DERP).
+    /// Per-peer transport selection from `PeerRouteUpdate`.
     routes: RwLock<HashMap<PeerId, UnderlayTransportId>>,
-    /// Fallback transport (the direct UDP one) before routes are published.
+    /// Fallback (direct UDP) before routes are first published.
     direct: SharedDirect,
     peers: Mutex<HashMap<PeerId, PeerLink>>,
 }
 
 impl Shared {
-    /// The transport to send a peer's outbound WG payloads over: its published
-    /// route if any, else the direct UDP transport.
     fn transport_for(&self, peer: PeerId) -> Option<UnderlayTransportId> {
         self.routes
             .read()
@@ -155,24 +128,19 @@ impl KernelWg {
 
     /// Allocate an underlay transport, mirroring
     /// [`ts_dataplane::async_tokio::DataPlane::new_underlay_transport`].
-    ///
-    /// Returns the id, the receiver the transport reads outbound packets from,
-    /// and the sender it writes inbound packets to.
-    pub fn new_underlay_transport(
-        &self,
-    ) -> (
-        UnderlayTransportId,
-        tokio::sync::mpsc::UnboundedReceiver<(PeerId, Vec<PacketMut>)>,
-        InboundTx,
-    ) {
-        let id: UnderlayTransportId = self.shared.next_transport.fetch_add(1, Ordering::Relaxed).into();
+    pub fn new_underlay_transport(&self) -> (UnderlayTransportId, PacketRx, PacketTx) {
+        let id = self
+            .shared
+            .next_transport
+            .fetch_add(1, Ordering::Relaxed)
+            .into();
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
         self.shared.transports.write().unwrap().insert(id, out_tx);
         (id, out_rx, self.shared.inbound_tx.clone())
     }
 
-    /// A dummy overlay transport. Nothing consumes it in kernel mode (there is
-    /// no netstack); it exists only so the `RouteUpdater` has an id.
+    /// A dummy overlay transport; nothing consumes it in kernel mode. It only
+    /// exists so the `RouteUpdater` has an id.
     pub fn new_overlay_transport(
         &self,
     ) -> (
@@ -185,12 +153,11 @@ impl KernelWg {
         (0u32.into(), up_tx, down_rx)
     }
 
-    /// Apply the per-peer transport selection from a `PeerRouteUpdate`.
     pub fn set_routes(&self, routes: HashMap<PeerId, UnderlayTransportId>) {
         *self.shared.routes.write().unwrap() = routes;
     }
 
-    /// Set the device's own tailnet IPv4 address (from the self node).
+    /// Set the device's own tailnet IPv4 address.
     pub async fn set_self_addr(&self, addr: Ipv4Addr) {
         let cidr = format!("{addr}/32");
         run(&["ip", "addr", "replace", &cidr, "dev", &self.shared.ifname]).await;
@@ -199,7 +166,7 @@ impl KernelWg {
     /// Reconcile the kernel device's peers with a netmap update.
     pub async fn program_peers(&self, state: &PeerState) {
         for id in &state.deletions {
-            // Drop the lock before awaiting (the guard is not `Send`).
+            // Bind before the await: the guard must not live across it.
             let removed = self.shared.peers.lock().unwrap().remove(id);
             if let Some(link) = removed {
                 run(&[
@@ -215,17 +182,20 @@ impl KernelWg {
             };
             let pubkey = base64_encode(&node.node_key.to_bytes());
 
-            // Allowed IPs: the peer's own /32 plus any IPv4 subnet routes it
-            // advertises. IPv6 is left out — the underlay is v4-only here.
-            let mut allowed: Vec<String> = vec![format!("{}/32", node.tailnet_address.ipv4.addr())];
-            for route in &node.accepted_routes {
-                if route.addr().is_ipv4() {
-                    allowed.push(route.to_string());
-                }
-            }
+            // The peer's /32 plus its IPv4 subnet routes; the underlay is
+            // v4-only here so IPv6 is skipped.
+            let mut allowed = vec![format!("{}/32", node.tailnet_address.ipv4.addr())];
+            allowed.extend(
+                node.accepted_routes
+                    .iter()
+                    .filter(|r| r.addr().is_ipv4())
+                    .map(|r| r.to_string()),
+            );
             let allowed = allowed.join(",");
 
-            let port = self.ensure_link(*id, pubkey.clone()).await;
+            let Some(port) = self.ensure_link(*id, pubkey.clone()).await else {
+                continue;
+            };
             let endpoint = format!("127.0.0.1:{port}");
 
             run(&[
@@ -243,49 +213,55 @@ impl KernelWg {
             ])
             .await;
         }
-
-        // Also route each peer's /32 through the device so the kernel sends
-        // return traffic over wg0.
-        for node in state.peers.peers().values() {
-            let cidr = format!("{}/32", node.tailnet_address.ipv4.addr());
-            run(&["ip", "route", "replace", &cidr, "dev", &self.shared.ifname]).await;
-        }
     }
 
     /// Ensure a loopback link exists for `peer`, returning its local port.
-    async fn ensure_link(&self, peer: PeerId, pubkey: String) -> u16 {
-        if let Some(link) = self.shared.peers.lock().unwrap().get(&peer) {
-            return link.sock.local_addr().map(|a| a.port()).unwrap_or(0);
+    async fn ensure_link(&self, peer: PeerId, pubkey: String) -> Option<u16> {
+        let existing = self
+            .shared
+            .peers
+            .lock()
+            .unwrap()
+            .get(&peer)
+            .and_then(|l| l.sock.local_addr().ok());
+        if let Some(addr) = existing {
+            return Some(addr.port());
         }
 
         let sock = match bind_loopback().await {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 tracing::error!(error = %e, "binding loopback socket for peer");
-                return 0;
+                return None;
             }
         };
-        let port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
+        let port = sock.local_addr().ok()?.port();
 
         let reader = tokio::spawn(reader_pump(self.shared.clone(), peer, sock.clone()));
 
-        self.shared
-            .peers
-            .lock()
-            .unwrap()
-            .insert(peer, PeerLink { sock, reader, pubkey });
-
-        port
+        self.shared.peers.lock().unwrap().insert(
+            peer,
+            PeerLink {
+                sock,
+                reader,
+                pubkey,
+            },
+        );
+        Some(port)
     }
 }
 
-/// Forward inbound WG payloads (from any transport) to the kernel device via
-/// each peer's loopback socket.
-async fn inbound_pump(shared: Arc<Shared>, mut inbound_rx: InboundRx) {
+/// Inbound WG payloads (any transport) → the kernel device.
+async fn inbound_pump(shared: Arc<Shared>, mut inbound_rx: PacketRx) {
     while let Some((peer, pkts)) = inbound_rx.recv().await {
-        let sock = shared.peers.lock().unwrap().get(&peer).map(|l| l.sock.clone());
+        let sock = shared
+            .peers
+            .lock()
+            .unwrap()
+            .get(&peer)
+            .map(|l| l.sock.clone());
         let Some(sock) = sock else {
-            // No link yet (peer not programmed); the sender will retransmit.
+            // Peer not programmed yet; the sender will retransmit.
             continue;
         };
         for pkt in pkts {
@@ -296,7 +272,7 @@ async fn inbound_pump(shared: Arc<Shared>, mut inbound_rx: InboundRx) {
     }
 }
 
-/// Forward kernel-device output for one peer to its selected transport.
+/// Kernel-device output for one peer → its selected transport.
 async fn reader_pump(shared: Arc<Shared>, peer: PeerId, sock: Arc<UdpSocket>) {
     let mut buf = vec![0u8; 2048];
     loop {
@@ -319,7 +295,7 @@ async fn reader_pump(shared: Arc<Shared>, peer: PeerId, sock: Arc<UdpSocket>) {
     }
 }
 
-/// Bind a loopback UDP socket connected to the kernel device's listen port.
+/// Bind a loopback socket connected to the kernel device's listen port.
 async fn bind_loopback() -> std::io::Result<UdpSocket> {
     let sock = UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).await?;
     sock.connect(SocketAddr::V4(SocketAddrV4::new(
@@ -330,17 +306,17 @@ async fn bind_loopback() -> std::io::Result<UdpSocket> {
     Ok(sock)
 }
 
-/// Create (or reset) the kernel WireGuard device and set its private key.
+/// Create (or reset) the kernel device and set its private key.
 async fn init_device(ifname: &str, key: &[u8; 32]) -> Result<(), String> {
-    // Start from a clean slate so leftover peers from a previous run don't
-    // linger (the kernel device survives a userspace restart).
+    // Clean slate: the device survives userspace restarts and may hold stale
+    // peers.
     run(&["ip", "link", "del", "dev", ifname]).await;
 
     if !run(&["ip", "link", "add", "dev", ifname, "type", "wireguard"]).await {
         return Err(format!("could not create wireguard device {ifname}"));
     }
 
-    // Feed the private key through a 0600 tmpfile so it never appears in argv.
+    // The key goes through a 0600 tmpfile so it never appears in argv.
     let key_b64 = base64_encode(key);
     let key_path = format!("/tmp/.tsrs_wg_{ifname}.key");
     if let Err(e) = write_private_key(&key_path, &key_b64) {
@@ -361,7 +337,8 @@ async fn init_device(ifname: &str, key: &[u8; 32]) -> Result<(), String> {
         return Err("could not set wg private key / listen port".to_string());
     }
 
-    run(&["ip", "link", "set", "dev", ifname, "mtu", &WG_MTU.to_string(), "up"]).await;
+    let mtu = WG_MTU.to_string();
+    run(&["ip", "link", "set", "dev", ifname, "mtu", &mtu, "up"]).await;
     run(&["ip", "route", "replace", TAILNET_CIDR, "dev", ifname]).await;
 
     tracing::info!(ifname, "kernel wireguard device up");
@@ -400,7 +377,7 @@ async fn run(args: &[&str]) -> bool {
     }
 }
 
-/// Standard base64 (with padding), as WireGuard tools expect for keys.
+/// Standard base64 with padding, as WireGuard tools expect.
 fn base64_encode(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -411,8 +388,16 @@ fn base64_encode(data: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(T[(n >> 18 & 63) as usize] as char);
         out.push(T[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -430,7 +415,6 @@ mod tests {
         assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
         assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-        // 32 zero bytes → the canonical all-zero WG key.
         assert_eq!(
             base64_encode(&[0u8; 32]),
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="

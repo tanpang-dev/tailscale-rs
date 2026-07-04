@@ -188,15 +188,13 @@ impl UnderlayTransport for UdpTransport {
                     buf.truncate(len);
                     match classify(&buf) {
                         PacketKind::Disco => {
-                            // Disco from a known peer also proves the direct path
-                            // is live. Peers (e.g. macOS) ping every ~5s even when
-                            // idle, so stamping here keeps the direct route from
-                            // decaying to DERP between bulk transfers, when no
-                            // WireGuard data is flowing to refresh it.
-                            // NB: bind the lookup result first so the read
-                            // guard is dropped before taking the write locks
-                            // below (an `if let` on the guard expression would
-                            // keep it alive across the body and self-deadlock).
+                            // Disco from a known peer proves the direct path is
+                            // live even when no WireGuard data is flowing, so
+                            // stamp liveness and learn the address here too.
+                            //
+                            // NB: bind the lookup before the writes — an
+                            // `if let` on the guard expression would hold the
+                            // read guard across the body and self-deadlock.
                             let peer =
                                 self.table.read().unwrap().addr_to_peer.get(&src).copied();
                             if let Some(peer) = peer {
@@ -205,11 +203,9 @@ impl UnderlayTransport for UdpTransport {
                                     .unwrap()
                                     .last_recv
                                     .insert(peer, Instant::now());
-                                // Learn the working address from disco too, so
-                                // outbound WireGuard follows the same path.
                                 self.table.write().unwrap().record_recv(peer, src);
                             }
-                            // Best-effort: drop the packet if the observer has gone away.
+                            // Best-effort: drop if the observer has gone away.
                             drop(self.disco_tx.send((src, buf)));
                             continue;
                         }
@@ -233,15 +229,10 @@ struct AddrTable {
     peer_to_addr: HashMap<PeerId, SocketAddr>,
     /// Reverse map for classifying inbound packets by source address.
     addr_to_peer: HashMap<SocketAddr, PeerId>,
-    /// The source address we last received a valid packet from, per peer.
-    ///
-    /// A peer advertises several endpoints (LAN, WAN, STUN-reflexive), and only
-    /// one of them is actually reachable from here. Sending to the *first*
-    /// advertised endpoint often picks an unreachable one (e.g. the peer's WAN
-    /// address, which does not hairpin on the local router). So, like
-    /// magicsock's best-endpoint selection, we learn the working address from
-    /// the source of packets the peer actually reaches us on (disco or
-    /// WireGuard) and prefer it for our outbound traffic.
+    /// The source address each peer last reached us on. Of a peer's several
+    /// advertised endpoints (LAN, WAN, STUN-reflexive) typically only one is
+    /// reachable from here, and it is not necessarily the first, so outbound
+    /// traffic prefers this learned address — magicsock-style.
     learned: HashMap<PeerId, SocketAddr>,
 }
 
@@ -470,6 +461,13 @@ fn spawn_recv_pump(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
+        // Pump-local record of the last liveness stamp per peer, so the shared
+        // write locks are taken about once a second instead of per packet —
+        // during bulk transfer that is thousands of packets a second on a CPU
+        // with no cycles to spare. DIRECT_TTL is 15s, so 1s granularity loses
+        // nothing.
+        let mut last_stamp: HashMap<PeerId, (Instant, SocketAddr)> = HashMap::new();
+
         loop {
             let batch = tokio::select! {
                 _ = async { drop(shutdown.wait_for(|x| *x).await) } => break,
@@ -492,17 +490,18 @@ fn spawn_recv_pump(
                     continue;
                 };
 
-                // Receiving real traffic direct from this peer means the direct
-                // path is live: mark it so we route our outbound to it over UDP too.
-                direct
-                    .write()
-                    .unwrap()
-                    .last_recv
-                    .insert(peer_id, Instant::now());
-
-                // Learn the address the peer actually reaches us on, so our
-                // outbound goes back over the same working path.
-                table.write().unwrap().record_recv(peer_id, src);
+                // Inbound traffic proves the direct path is live and tells us
+                // which of the peer's endpoints actually works.
+                let now = Instant::now();
+                let stale = match last_stamp.get(&peer_id) {
+                    Some((at, addr)) => *addr != src || now - *at >= Duration::from_secs(1),
+                    None => true,
+                };
+                if stale {
+                    last_stamp.insert(peer_id, (now, src));
+                    direct.write().unwrap().last_recv.insert(peer_id, now);
+                    table.write().unwrap().record_recv(peer_id, src);
+                }
 
                 if to_dataplane
                     .send((peer_id, pkts.into_iter().collect()))
