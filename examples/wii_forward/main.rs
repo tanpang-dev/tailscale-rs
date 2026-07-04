@@ -115,6 +115,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let tailnet_ip = dev.ipv4_addr().await?;
     tracing::info!(%tailnet_ip, "joined tailnet");
 
+    // In kernel-WireGuard mode there is no userspace netstack: decrypted traffic
+    // is delivered straight to the kernel IP stack on the wg device, so the box's
+    // real services (sshd, smbd) answer on the tailnet IP directly and the
+    // userspace TCP forwards below are neither possible nor needed.
+    if std::env::var("TS_RS_KERNEL_WG").is_ok_and(|v| !v.trim().is_empty()) {
+        tracing::info!(%tailnet_ip, "kernel wireguard mode: services reachable directly, no forwards");
+        std::future::pending::<()>().await;
+        return Ok(());
+    }
+
     let mut listeners = Vec::new();
     for fwd in forwards {
         let listen_addr: SocketAddr = (tailnet_ip, fwd.tailnet_port).into();

@@ -36,7 +36,7 @@ kameo = "0.21"
 kameo_actors = "0.6"
 rand.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process"] }
 tokio-stream = { version = "0.1", default-features = false, features = ["time"] }
 tracing.workspace = true
 smallvec.workspace = true

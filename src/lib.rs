@@ -152,7 +152,10 @@ pub mod ssh;
 /// construction-time.
 pub struct Device {
     runtime: ts_runtime::Runtime,
-    channel: Channel,
+    /// The netstack command channel. Absent in kernel-WireGuard mode, where the
+    /// kernel handles L3 directly and there is no userspace netstack — the
+    /// socket methods ([`Device::tcp_listen`], etc.) then return an error.
+    channel: Option<Channel>,
 }
 
 impl Device {
@@ -177,12 +180,22 @@ impl Device {
 
         let rt =
             ts_runtime::Runtime::spawn(config.into(), auth_key, (&config.key_state).into()).await?;
-        let channel = rt.channel().await?;
+        // In kernel-WireGuard mode there is no netstack, so there is no channel;
+        // that is expected and not fatal.
+        let channel = rt.channel().await.ok();
 
         Ok(Self {
             runtime: rt,
             channel,
         })
+    }
+
+    /// The netstack channel, or an error in kernel-WireGuard mode where there
+    /// is none.
+    fn channel(&self) -> Result<&Channel, Error> {
+        self.channel
+            .as_ref()
+            .ok_or(Error::Internal(InternalErrorKind::Actor))
     }
 
     /// Get this [`Device`]'s IPv4 tailnet address.
@@ -207,7 +220,10 @@ impl Device {
 
     /// Bind a UDP socket to the specified [`SocketAddr`].
     pub async fn udp_bind(&self, socket_addr: SocketAddr) -> Result<netstack::UdpSocket, Error> {
-        self.channel.udp_bind(socket_addr).await.map_err(Into::into)
+        self.channel()?
+            .udp_bind(socket_addr)
+            .await
+            .map_err(Into::into)
     }
 
     /// Bind a TCP listener to the specified [`SocketAddr`].
@@ -215,7 +231,7 @@ impl Device {
         &self,
         socket_addr: SocketAddr,
     ) -> Result<netstack::TcpListener, Error> {
-        self.channel
+        self.channel()?
             .tcp_listen(socket_addr)
             .await
             .map_err(Into::into)
@@ -231,7 +247,7 @@ impl Device {
         // TODO(npry): collision checking
         let ephemeral_port = rand::random_range(49152..=u16::MAX);
 
-        self.channel
+        self.channel()?
             .tcp_connect((ip, ephemeral_port).into(), remote)
             .await
             .map_err(Into::into)

@@ -26,13 +26,47 @@ use std::{
 use kameo::actor::ActorRef;
 use tokio::{net::UdpSocket, sync::mpsc};
 use ts_packet::PacketMut;
-use ts_transport::{BatchRecvIter, BatchSendIter, PeerId, UnderlayTransport};
+use ts_transport::{BatchRecvIter, BatchSendIter, PeerId, UnderlayTransport, UnderlayTransportId};
 
 use crate::{
     dataplane::{DataplaneActor, UnderlayFromDataplane, UnderlayToDataplane},
     env::Env,
     peer_tracker::PeerState,
 };
+
+/// How long after the last inbound UDP packet from a peer we keep treating the
+/// direct path as live for routing. If the direct path dies, no more UDP
+/// arrives, the peer goes stale, and routing reverts to DERP.
+const DIRECT_TTL: Duration = Duration::from_secs(15);
+
+/// Shared record of which peers have a live direct UDP path, plus the id of the
+/// UDP underlay transport. Read by the route updater to route outbound traffic
+/// for a peer over UDP when its path is fresh, falling back to DERP otherwise.
+#[derive(Default)]
+pub struct DirectState {
+    /// The UDP underlay transport id, once registered with the dataplane.
+    udp_transport_id: Option<UnderlayTransportId>,
+    /// Last time an inbound UDP packet was received from each peer.
+    last_recv: HashMap<PeerId, Instant>,
+}
+
+impl DirectState {
+    /// The UDP transport to use for a peer, if its direct path is currently live.
+    pub fn direct_transport(&self, peer: PeerId) -> Option<UnderlayTransportId> {
+        let id = self.udp_transport_id?;
+        let last = self.last_recv.get(&peer)?;
+        (last.elapsed() < DIRECT_TTL).then_some(id)
+    }
+
+    /// The UDP underlay transport id, if registered. Used by the kernel-WG
+    /// bridge as the fallback transport before per-peer routes are published.
+    pub fn udp_transport_id(&self) -> Option<UnderlayTransportId> {
+        self.udp_transport_id
+    }
+}
+
+/// Shared handle to [`DirectState`].
+pub type SharedDirect = Arc<RwLock<DirectState>>;
 
 /// The default port, matching the Go client's default magicsock port.
 const DEFAULT_PORT: u16 = 41641;
@@ -125,6 +159,9 @@ pub type DiscoPacket = (SocketAddr, Vec<u8>);
 struct UdpTransport {
     socket: Arc<UdpSocket>,
     disco_tx: mpsc::UnboundedSender<DiscoPacket>,
+    /// For stamping direct-path liveness on inbound disco (see `recv`).
+    table: Arc<RwLock<AddrTable>>,
+    direct: SharedDirect,
 }
 
 impl UnderlayTransport for UdpTransport {
@@ -151,6 +188,23 @@ impl UnderlayTransport for UdpTransport {
                     buf.truncate(len);
                     match classify(&buf) {
                         PacketKind::Disco => {
+                            // Disco from a known peer also proves the direct path
+                            // is live. Peers (e.g. macOS) ping every ~5s even when
+                            // idle, so stamping here keeps the direct route from
+                            // decaying to DERP between bulk transfers, when no
+                            // WireGuard data is flowing to refresh it.
+                            if let Some(peer) =
+                                self.table.read().unwrap().addr_to_peer.get(&src).copied()
+                            {
+                                self.direct
+                                    .write()
+                                    .unwrap()
+                                    .last_recv
+                                    .insert(peer, Instant::now());
+                                // Learn the working address from disco too, so
+                                // outbound WireGuard follows the same path.
+                                self.table.write().unwrap().record_recv(peer, src);
+                            }
                             // Best-effort: drop the packet if the observer has gone away.
                             drop(self.disco_tx.send((src, buf)));
                             continue;
@@ -175,12 +229,24 @@ struct AddrTable {
     peer_to_addr: HashMap<PeerId, SocketAddr>,
     /// Reverse map for classifying inbound packets by source address.
     addr_to_peer: HashMap<SocketAddr, PeerId>,
+    /// The source address we last received a valid packet from, per peer.
+    ///
+    /// A peer advertises several endpoints (LAN, WAN, STUN-reflexive), and only
+    /// one of them is actually reachable from here. Sending to the *first*
+    /// advertised endpoint often picks an unreachable one (e.g. the peer's WAN
+    /// address, which does not hairpin on the local router). So, like
+    /// magicsock's best-endpoint selection, we learn the working address from
+    /// the source of packets the peer actually reaches us on (disco or
+    /// WireGuard) and prefer it for our outbound traffic.
+    learned: HashMap<PeerId, SocketAddr>,
 }
 
 impl AddrTable {
     fn rebuild(&mut self, state: &PeerState) {
         self.peer_to_addr.clear();
         self.addr_to_peer.clear();
+        // `learned` is intentionally preserved across netmap updates: a working
+        // path stays valid until we hear otherwise.
 
         for (id, node) in state.peers.peers() {
             for &addr in &node.underlay_addresses {
@@ -189,26 +255,45 @@ impl AddrTable {
             }
         }
     }
+
+    /// The address to send a peer's traffic to: the learned working address if
+    /// we have one, else its first advertised endpoint.
+    fn send_addr(&self, peer: PeerId) -> Option<SocketAddr> {
+        self.learned
+            .get(&peer)
+            .or_else(|| self.peer_to_addr.get(&peer))
+            .copied()
+    }
+
+    /// Record the source address a peer reached us on as its working address.
+    fn record_recv(&mut self, peer: PeerId, src: SocketAddr) {
+        self.learned.insert(peer, src);
+    }
 }
 
 /// Actor owning the UDP socket, the underlay transport, and its pumps.
 pub struct UdpUnderlay {
     table: Arc<RwLock<AddrTable>>,
+    ping_targets: crate::disco::PingTargets,
 }
 
 impl kameo::Actor for UdpUnderlay {
-    type Args = (Env, ActorRef<DataplaneActor>);
+    type Args = (Env, ActorRef<DataplaneActor>, SharedDirect);
     type Error = crate::Error;
 
     async fn on_start(
-        (env, dataplane): Self::Args,
+        (env, dataplane, direct): Self::Args,
         slf: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
         let table = Arc::new(RwLock::new(AddrTable::default()));
+        let ping_targets = crate::disco::PingTargets::default();
 
         let Some(port) = configured_port() else {
             tracing::trace!("udp transport disabled");
-            return Ok(Self { table });
+            return Ok(Self {
+                table,
+                ping_targets,
+            });
         };
 
         // Panicking in on_start is fine, this is checked as part of Runtime::spawn.
@@ -225,14 +310,20 @@ impl kameo::Actor for UdpUnderlay {
             // Observe-only: log disco packets but never reply.
             spawn_disco_observer(disco_rx, env.shutdown.clone());
             spawn_observe_only(socket, disco_tx, env.shutdown.clone());
-            return Ok(Self { table });
+            return Ok(Self {
+                table,
+                ping_targets,
+            });
         }
 
-        // Transport mode: reply to disco pings so peers can establish a direct path.
+        // Transport mode: reply to disco pings and actively ping peers so a direct
+        // path can be established in both directions.
         crate::disco::spawn(
             disco_rx,
             socket.clone(),
             env.keys.disco_keys.private.clone(),
+            env.keys.node_keys.public,
+            ping_targets.clone(),
             env.shutdown.clone(),
         );
 
@@ -242,13 +333,20 @@ impl kameo::Actor for UdpUnderlay {
             .ask(crate::dataplane::NewUnderlayTransport)
             .await?;
         tracing::info!(port, ?transport_id, "udp underlay transport listening");
+        direct.write().unwrap().udp_transport_id = Some(transport_id);
 
-        let transport = Arc::new(UdpTransport { socket, disco_tx });
+        let transport = Arc::new(UdpTransport {
+            socket,
+            disco_tx,
+            table: table.clone(),
+            direct: direct.clone(),
+        });
 
         spawn_recv_pump(
             transport.clone(),
             to_dataplane,
             table.clone(),
+            direct.clone(),
             env.shutdown.clone(),
         );
         spawn_send_pump(
@@ -258,7 +356,10 @@ impl kameo::Actor for UdpUnderlay {
             env.shutdown.clone(),
         );
 
-        Ok(Self { table })
+        Ok(Self {
+            table,
+            ping_targets,
+        })
     }
 }
 
@@ -271,6 +372,28 @@ impl kameo::message::Message<Arc<PeerState>> for UdpUnderlay {
         _ctx: &mut kameo::message::Context<Self, Self::Reply>,
     ) {
         self.table.write().unwrap().rebuild(&msg);
+
+        // Rebuild the set of peers to actively ping: those with both a disco key
+        // and at least one advertised endpoint.
+        let targets = msg
+            .peers
+            .peers()
+            .iter()
+            .filter_map(|(id, node)| {
+                let disco = node.disco_key?;
+                if node.underlay_addresses.is_empty() {
+                    return None;
+                }
+                Some((
+                    *id,
+                    crate::disco::PingTarget {
+                        endpoints: node.underlay_addresses.clone(),
+                        disco,
+                    },
+                ))
+            })
+            .collect();
+        *self.ping_targets.write().unwrap() = targets;
     }
 }
 
@@ -339,6 +462,7 @@ fn spawn_recv_pump(
     transport: Arc<UdpTransport>,
     to_dataplane: UnderlayToDataplane,
     table: Arc<RwLock<AddrTable>>,
+    direct: SharedDirect,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
@@ -363,6 +487,18 @@ fn spawn_recv_pump(
                     tracing::trace!(%src, "udp packet from unknown source, dropping");
                     continue;
                 };
+
+                // Receiving real traffic direct from this peer means the direct
+                // path is live: mark it so we route our outbound to it over UDP too.
+                direct
+                    .write()
+                    .unwrap()
+                    .last_recv
+                    .insert(peer_id, Instant::now());
+
+                // Learn the address the peer actually reaches us on, so our
+                // outbound goes back over the same working path.
+                table.write().unwrap().record_recv(peer_id, src);
 
                 if to_dataplane
                     .send((peer_id, pkts.into_iter().collect()))
@@ -396,7 +532,7 @@ fn spawn_send_pump(
                 break;
             };
 
-            let addr = table.read().unwrap().peer_to_addr.get(&peer_id).copied();
+            let addr = table.read().unwrap().send_addr(peer_id);
             let Some(addr) = addr else {
                 tracing::trace!(?peer_id, "no udp address for peer, dropping");
                 continue;

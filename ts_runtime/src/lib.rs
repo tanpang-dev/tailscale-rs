@@ -24,6 +24,7 @@ mod derp_latency;
 mod disco;
 mod env;
 mod error;
+mod kernel_wg;
 mod multiderp;
 mod netmon;
 mod netstack_actor;
@@ -100,7 +101,8 @@ pub struct Runtime {
     /// Reference to the control actor.
     pub control: ActorRef<ControlRunner>,
     dataplane: ActorRef<DataplaneActor>,
-    netstack: WeakActorRef<NetstackActor>,
+    /// The smoltcp netstack, absent in kernel-WG mode (the kernel handles L3).
+    netstack: Option<WeakActorRef<NetstackActor>>,
     /// Reference to the peer tracker for peer lookups.
     pub peer_tracker: WeakActorRef<PeerTracker>,
     env: Env,
@@ -117,43 +119,63 @@ impl Runtime {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let env = Env::new(keys, shutdown_rx);
 
-        let dataplane = DataplaneActor::spawn(env.clone());
+        // Shared live-direct-path state, written by the UDP transport and read
+        // by the route updater to route outbound traffic over UDP when possible.
+        // Created before the dataplane so the kernel-WG bridge can use it as its
+        // fallback transport.
+        let direct = udp_transport::SharedDirect::default();
+
+        // In kernel-WG mode the dataplane hands crypto to a kernel device and
+        // there is no smoltcp netstack, so skip spawning it.
+        let kernel_mode = kernel_wg::configured().is_some();
+
+        let dataplane = DataplaneActor::spawn((env.clone(), direct.clone()));
 
         let (netstack_id, netstack_up, netstack_down) =
             dataplane.ask(dataplane::NewOverlayTransport).await?;
 
         let multiderp = Multiderp::spawn((env.clone(), dataplane.clone()));
 
-        let rt_upd =
-            route_updater::RouteUpdater::spawn((multiderp.clone(), env.clone(), netstack_id));
+        let rt_upd = route_updater::RouteUpdater::spawn((
+            multiderp.clone(),
+            env.clone(),
+            netstack_id,
+            direct.clone(),
+        ));
         let pf_upd = packetfilter::PacketfilterUpdater::spawn(env.clone());
         let src_upd = src_filter::SourceFilterUpdater::spawn(env.clone());
         let stunner = stunner::Stunner::spawn(env.clone());
-        let udp = udp_transport::UdpUnderlay::spawn((env.clone(), dataplane.clone()));
+        let udp = udp_transport::UdpUnderlay::spawn((env.clone(), dataplane.clone(), direct));
 
         let netmon = ts_netmon::platform_mon()
             .map(|mon| netmon::NetmonActor::spawn((env.clone(), Arc::new(mon))));
 
         let peer_tracker = PeerTracker::spawn(env.clone());
 
-        let netstack = NetstackActor::spawn((
-            env.clone(),
-            netstack::netcore::Config {
-                // The default 16 KiB TCP socket buffer caps throughput on the
-                // high-latency DERP-relay path (tailscale-rs has no P2P fast
-                // path). A very large buffer (512 KiB) raises the peak but makes
-                // stalls worse: DERP is best-effort and drops packets under bulk
-                // load, and a large receive window is prone to a zero-window
-                // deadlock when the window-update segment is dropped. 128 KiB is
-                // a middle ground — more window than 16 KiB, but small enough to
-                // refill and re-advertise the window frequently. Cost: ~2x this
-                // per TCP connection (rx + tx buffers).
-                tcp_buffer_size: 128 * 1024,
-                ..Default::default()
-            },
-            netstack_up,
-            netstack_down,
-        ));
+        let netstack = if kernel_mode {
+            // No userspace L3 in kernel-WG mode; the dummy overlay channels go
+            // unused.
+            drop((netstack_up, netstack_down));
+            None
+        } else {
+            Some(NetstackActor::spawn((
+                env.clone(),
+                netstack::netcore::Config {
+                    // Per-connection TCP buffer size. Larger buffers raise the
+                    // window but, on this slow CPU, make zero-window stalls worse:
+                    // the receiver can't drain fast enough, advertises a zero
+                    // window, and the sender then backs off on its persist timer
+                    // (exponentially), so a big window turns into long multi-second
+                    // stalls. Smaller buffers refill and re-advertise the window
+                    // more often, trading peak throughput for steadier progress.
+                    // Tunable via TS_RS_TCP_BUFFER (bytes) to find the best point.
+                    tcp_buffer_size: tcp_buffer_size(),
+                    ..Default::default()
+                },
+                netstack_up,
+                netstack_down,
+            )))
+        };
 
         let control = ControlRunner::spawn(control_runner::Params {
             config,
@@ -167,14 +189,14 @@ impl Runtime {
             control: control.clone(),
             dataplane: dataplane.clone(),
             peer_tracker: peer_tracker.downgrade(),
-            netstack: netstack.downgrade(),
+            netstack: netstack.as_ref().map(|n| n.downgrade()),
             env,
             shutdown: shutdown_tx,
         };
 
         tracing::trace!("waiting for actors to finish starting");
         try_join_startup![
-            [netmon],
+            [netmon netstack],
             dataplane,
             rt_upd,
             pf_upd,
@@ -182,7 +204,6 @@ impl Runtime {
             stunner,
             udp,
             peer_tracker,
-            netstack,
             control,
         ]?;
         tracing::trace!("all root actors started ok");
@@ -191,15 +212,22 @@ impl Runtime {
     }
 
     /// Get a channel to send commands to the netstack.
+    ///
+    /// Returns [`ErrorKind::ActorGone`] in kernel-WG mode, where there is no
+    /// userspace netstack (the kernel handles L3 directly).
     pub async fn channel(&self) -> Result<Channel, Error> {
+        let actor_gone = || Error {
+            kind: ErrorKind::ActorGone,
+            target_actor: None,
+            message_ty: None,
+        };
+
         let (channel,) = self
             .netstack
+            .as_ref()
+            .ok_or_else(actor_gone)?
             .upgrade()
-            .ok_or(Error {
-                kind: ErrorKind::ActorGone,
-                target_actor: None,
-                message_ty: None,
-            })?
+            .ok_or_else(actor_gone)?
             .ask(netstack_actor::GetChannel)
             .await?;
 
@@ -276,5 +304,30 @@ fn try_shutdown(a: &ActorRef<impl kameo::Actor>) {
     if let Err(e) = a.mailbox_sender().try_send(Signal::Stop) {
         tracing::error!(error = %e, "graceful shutdown failed, killing actor");
         a.kill();
+    }
+}
+
+/// The per-connection TCP buffer size, from `TS_RS_TCP_BUFFER` (bytes) or a
+/// default of 128 KiB. Exposed as an env var so the best value for a given
+/// link/CPU can be found without recompiling.
+fn tcp_buffer_size() -> usize {
+    // 32 KiB. On a slow receiver (e.g. the Wii's 729 MHz CPU) a larger window
+    // makes zero-window stalls worse: measured over a direct tailnet path, a
+    // 2 MiB transfer completes at 16/32 KiB but hangs indefinitely at 64/128 KiB,
+    // because the sender overruns the receiver, hits a zero window, and backs off
+    // on its persist timer. 32 KiB is the largest size that stayed stable here.
+    // Sustained bulk transfers still benefit from sender-side pacing (e.g.
+    // `scp -l`) matched to the receiver's drain rate.
+    const DEFAULT: usize = 32 * 1024;
+
+    match std::env::var("TS_RS_TCP_BUFFER") {
+        Ok(v) => match v.trim().parse() {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(value = %v, error = %e, "unparseable TS_RS_TCP_BUFFER, using default");
+                DEFAULT
+            }
+        },
+        Err(_) => DEFAULT,
     }
 }

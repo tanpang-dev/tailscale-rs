@@ -10,34 +10,131 @@
 //! Disco packets are siphoned off the UDP socket by [`crate::udp_transport`] and
 //! delivered here on a channel.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use rand::Rng;
 use tokio::{net::UdpSocket, sync::mpsc, sync::watch};
 use ts_disco_protocol::{Encrypted, Packet, Ping, Plaintext, Pong};
-use ts_keys::{DiscoPrivateKey, DiscoPublicKey};
+use ts_keys::{DiscoPrivateKey, DiscoPublicKey, NodePublicKey};
+use ts_transport::PeerId;
 
 use crate::udp_transport::DiscoPacket;
 
-/// Spawn the disco responder task. It runs until `shutdown` flips or the channel
-/// closes.
+/// How often we send disco pings to each peer's endpoints.
+///
+/// This keeps NAT mappings open and, more importantly, drives the *bidirectional*
+/// disco handshake: a full-client peer only commits to sending real traffic over
+/// the direct path once it has seen pings from us as well as answered ours.
+const PING_INTERVAL: Duration = Duration::from_secs(5);
+
+/// A peer we actively ping to try to open a direct path.
+#[derive(Clone)]
+pub struct PingTarget {
+    /// The peer's advertised UDP endpoints.
+    pub endpoints: Vec<SocketAddr>,
+    /// The peer's disco public key, to encrypt pings to.
+    pub disco: DiscoPublicKey,
+}
+
+/// Shared, rebuilt-from-netmap set of peers to ping, keyed by peer id.
+pub type PingTargets = Arc<RwLock<HashMap<PeerId, PingTarget>>>;
+
+/// Spawn the disco responder and the active pinger. They run until `shutdown`
+/// flips or the channel closes.
 pub fn spawn(
     mut rx: mpsc::UnboundedReceiver<DiscoPacket>,
     socket: Arc<UdpSocket>,
     disco_private: DiscoPrivateKey,
+    node_public: NodePublicKey,
+    targets: PingTargets,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    // Responder: reply to incoming pings.
+    {
+        let socket = socket.clone();
+        let disco_private = disco_private.clone();
+        let mut shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = async { drop(shutdown.wait_for(|x| *x).await) } => break,
+                    pkt = rx.recv() => match pkt {
+                        Some((src, buf)) => handle(src, buf, &socket, &disco_private).await,
+                        None => break,
+                    },
+                }
+            }
+        });
+    }
+
+    // Active pinger: periodically ping each peer's endpoints.
     tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(PING_INTERVAL);
         loop {
             tokio::select! {
                 _ = async { drop(shutdown.wait_for(|x| *x).await) } => break,
-                pkt = rx.recv() => match pkt {
-                    Some((src, buf)) => handle(src, buf, &socket, &disco_private).await,
-                    None => break,
-                },
+                _ = ticker.tick() => {
+                    send_pings(&socket, &disco_private, node_public, &targets).await;
+                }
             }
         }
     });
+}
+
+/// Send a disco ping to every endpoint of every known peer.
+async fn send_pings(
+    socket: &UdpSocket,
+    disco_private: &DiscoPrivateKey,
+    node_public: NodePublicKey,
+    targets: &PingTargets,
+) {
+    // Snapshot under the lock so we don't hold it across awaits.
+    let snapshot: Vec<PingTarget> = targets.read().unwrap().values().cloned().collect();
+
+    for target in snapshot {
+        let ping = match build_ping(node_public, target.disco, disco_private) {
+            Ok(ping) => ping,
+            Err(e) => {
+                tracing::warn!(error = %e, "building disco ping");
+                continue;
+            }
+        };
+
+        for endpoint in target.endpoints {
+            if let Err(e) = socket.send_to(&ping, endpoint).await {
+                tracing::trace!(%endpoint, error = %e, "sending disco ping");
+            }
+        }
+    }
+}
+
+/// Build and encrypt a disco ping to `peer_disco`.
+fn build_ping(
+    node_public: NodePublicKey,
+    peer_disco: DiscoPublicKey,
+    disco_private: &DiscoPrivateKey,
+) -> Result<Vec<u8>, DiscoError> {
+    let mut buf = Packet::<Plaintext>::vec_for_message(Ping::size_with_padding(0));
+
+    {
+        let pkt = Packet::<Plaintext>::init_from_bytes::<Ping>(&mut buf, |ping: &mut Ping| {
+            let mut tx_id = [0u8; 12];
+            rand::rng().fill_bytes(&mut tx_id);
+            ping.tx_id = tx_id;
+            ping.node_key = node_public;
+        })?;
+
+        let mut nonce = [0u8; 24];
+        rand::rng().fill_bytes(&mut nonce);
+        pkt.encrypt_in_place(disco_private, &peer_disco, nonce)?;
+    }
+
+    Ok(buf)
 }
 
 /// Decrypt a received disco packet and, if it is a ping, reply with a pong.
